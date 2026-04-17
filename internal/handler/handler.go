@@ -1,13 +1,16 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
 	"regexp"
+	"time"
 
 	"github.com/ladydd/taskgate/internal/model"
+	"github.com/ladydd/taskgate/internal/queue"
 	"github.com/ladydd/taskgate/internal/service"
 	"github.com/ladydd/taskgate/internal/store"
 
@@ -71,7 +74,7 @@ func (h *Handler) Submit(c *gin.Context) {
 
 	input := json.RawMessage(body)
 
-	if errs := h.svc.ValidateRequest(input); len(errs) > 0 {
+	if errs := h.svc.ValidateRequest(c.Request.Context(), input); len(errs) > 0 {
 		c.JSON(http.StatusBadRequest, model.ErrorResponse{
 			Error:   "validation_error",
 			Details: errs,
@@ -89,9 +92,25 @@ func (h *Handler) Submit(c *gin.Context) {
 	}
 
 	// Enqueue the task for async processing by the worker pool.
-	// If enqueue fails, mark the task as failed so it doesn't stay pending forever.
 	if err := h.svc.EnqueueTask(c.Request.Context(), taskID, input); err != nil {
-		h.svc.MarkTaskFailed(c.Request.Context(), taskID, "failed to enqueue task")
+		// The request context may already be cancelled (it's what caused the enqueue
+		// to fail in the first place). Use a fresh, short-lived context for any
+		// post-enqueue store updates so they don't fail on a dead context.
+		storeCtx, storeCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer storeCancel()
+
+		if errors.Is(err, queue.ErrEnqueueUncertain) {
+			h.svc.MarkEnqueueUncertain(storeCtx, taskID)
+			c.JSON(http.StatusAccepted, gin.H{
+				"uuid":    taskID,
+				"status":  "pending",
+				"warning": "enqueue confirmation timed out; task may still be processed — poll /result/" + taskID,
+			})
+			return
+		}
+
+		// Definite failure (nack, channel down, marshal error) — safe to mark failed.
+		h.svc.MarkTaskFailed(storeCtx, taskID, "failed to enqueue task")
 		c.JSON(http.StatusInternalServerError, model.ErrorResponse{
 			Error:   "internal_error",
 			Details: []string{"failed to enqueue task"},

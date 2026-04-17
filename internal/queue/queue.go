@@ -6,7 +6,18 @@ package queue
 import (
 	"context"
 	"encoding/json"
+	"errors"
 )
+
+// ErrEnqueueNacked is returned when the broker explicitly rejected (nacked) the message.
+// This is a definite failure — the message was NOT accepted.
+var ErrEnqueueNacked = errors.New("broker nacked message")
+
+// ErrEnqueueUncertain is returned when the publish confirm could not be verified
+// (e.g. context cancelled, timeout). The message MAY or MAY NOT have been accepted
+// by the broker. Callers should NOT mark the task as failed because the message
+// might still be delivered to a consumer.
+var ErrEnqueueUncertain = errors.New("enqueue outcome uncertain")
 
 // TaskMessage is the unit of work passed through the queue.
 type TaskMessage struct {

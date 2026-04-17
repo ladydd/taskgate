@@ -25,8 +25,9 @@ type TaskProcessor interface {
 
 // RequestValidator validates the raw request body before a task is created.
 // It returns a list of human-readable error descriptions; an empty slice means valid.
+// The context should be used for any I/O operations (e.g. DNS resolution for SSRF checks).
 type RequestValidator interface {
-	Validate(input json.RawMessage) []string
+	Validate(ctx context.Context, input json.RawMessage) []string
 }
 
 // LogSanitizer is an optional hook that strips sensitive fields from the task input
@@ -174,8 +175,8 @@ func (s *TaskService) worker(ctx context.Context, id int) {
 }
 
 // ValidateRequest validates the raw input and returns validation errors.
-func (s *TaskService) ValidateRequest(input json.RawMessage) []string {
-	return s.validator.Validate(input)
+func (s *TaskService) ValidateRequest(ctx context.Context, input json.RawMessage) []string {
+	return s.validator.Validate(ctx, input)
 }
 
 // CreateTask creates a new pending task in the store and returns the task ID.
@@ -220,6 +221,21 @@ func (s *TaskService) MarkTaskFailed(ctx context.Context, taskID string, reason 
 	}
 }
 
+// MarkEnqueueUncertain records that the publisher confirm for this task timed out
+// or was cancelled. The task stays "pending" but carries a timestamp so that
+// GetTaskResult can apply a bounded timeout to this specific subset of pending tasks.
+func (s *TaskService) MarkEnqueueUncertain(ctx context.Context, taskID string) {
+	now := time.Now().Unix()
+	task := &model.Task{
+		UUID:               taskID,
+		EnqueueUncertainAt: now,
+		UpdatedAt:          now,
+	}
+	if err := s.store.UpdateTask(ctx, task); err != nil {
+		slog.Error("failed to mark task as enqueue-uncertain", "uuid", taskID, "error", err)
+	}
+}
+
 // GetTaskResult retrieves a task by UUID, checking the fallback store when appropriate.
 func (s *TaskService) GetTaskResult(ctx context.Context, taskUUID string) (*model.Task, error) {
 	task, err := s.store.GetTask(ctx, taskUUID)
@@ -230,20 +246,42 @@ func (s *TaskService) GetTaskResult(ctx context.Context, taskUUID string) (*mode
 		return nil, err
 	}
 
-	if task.Status == "pending" {
+	if task.Status == "pending" || task.Status == "processing" {
 		if fallbackTask, fallbackErr := s.getFallbackTask(ctx, taskUUID); fallbackErr == nil {
 			return fallbackTask, nil
 		}
 
-		stuckThreshold := int64(s.taskTimeout * 2)
-		if task.CreatedAt > 0 && time.Now().Unix()-task.CreatedAt > stuckThreshold {
-			task.Status = "failed"
-			task.Error = "task processing timed out, possibly due to an internal state update failure; please resubmit"
-			task.UpdatedAt = time.Now().Unix()
+		// Stuck detection: only applies to tasks that a worker has started processing.
+		// Pending tasks are still queued — they haven't timed out, they're just waiting.
+		// Marking a pending task as failed would be wrong under backlog, rate limiting,
+		// or low worker counts.
+		if task.Status == "processing" && task.StartedAt > 0 {
+			stuckThreshold := int64(s.taskTimeout * 2)
+			if time.Now().Unix()-task.StartedAt > stuckThreshold {
+				task.Status = "failed"
+				task.Error = "task processing timed out, possibly due to an internal state update failure; please resubmit"
+				task.UpdatedAt = time.Now().Unix()
 
-			// Persist the status change so subsequent queries see the same result.
-			if err := s.store.UpdateTask(ctx, task); err != nil {
-				slog.Error("failed to persist stuck task status", "uuid", task.UUID, "error", err)
+				if err := s.store.UpdateTask(ctx, task); err != nil {
+					slog.Error("failed to persist stuck task status", "uuid", task.UUID, "error", err)
+				}
+			}
+		}
+
+		// Uncertain-enqueue timeout: only applies to pending tasks where the publisher
+		// confirm was inconclusive. If the broker never actually accepted the message,
+		// the task would sit in pending forever. We give it a generous timeout (3× task
+		// timeout) before marking it failed with a distinct error message.
+		if task.Status == "pending" && task.EnqueueUncertainAt > 0 {
+			uncertainThreshold := int64(s.taskTimeout * 3)
+			if time.Now().Unix()-task.EnqueueUncertainAt > uncertainThreshold {
+				task.Status = "failed"
+				task.Error = "enqueue confirmation timed out and task was never picked up for processing; please resubmit"
+				task.UpdatedAt = time.Now().Unix()
+
+				if err := s.store.UpdateTask(ctx, task); err != nil {
+					slog.Error("failed to persist uncertain-enqueue timeout", "uuid", task.UUID, "error", err)
+				}
 			}
 		}
 	}
@@ -282,24 +320,38 @@ func (s *TaskService) sanitizeOutputForLog(output json.RawMessage) string {
 
 // processTask calls the TaskProcessor and updates the task state.
 func (s *TaskService) processTask(taskID string, input json.RawMessage) {
-	ctx := context.WithValue(context.Background(), ContextKeyRequestID, taskID)
-	ctx = logger.WithLogger(ctx, s.logger)
-	ctx = context.WithValue(ctx, logger.RequestIDCtxKey(), taskID)
+	// Base context for store operations — no timeout, so retries aren't killed by the process deadline.
+	baseCtx := context.WithValue(context.Background(), ContextKeyRequestID, taskID)
+	baseCtx = logger.WithLogger(baseCtx, s.logger)
+	baseCtx = context.WithValue(baseCtx, logger.RequestIDCtxKey(), taskID)
 
-	// Framework-level timeout — ensures no task can block a worker forever,
-	// even if the TaskProcessor implementation forgets to set its own deadline.
-	ctx, cancel := context.WithTimeout(ctx, time.Duration(s.taskTimeout)*time.Second)
-	defer cancel()
+	// Mark task as "processing" with a start timestamp before calling Process().
+	// This lets stuck-task detection measure from actual processing start, not creation time.
+	// Also clears EnqueueUncertainAt — the message was delivered, uncertainty is resolved.
+	now := time.Now().Unix()
+	s.updateTaskBestEffort(baseCtx, taskID, &model.Task{
+		UUID:                  taskID,
+		Status:                "processing",
+		StartedAt:             now,
+		UpdatedAt:             now,
+		ClearEnqueueUncertain: true,
+	})
 
-	s.logger.LogStep(ctx, taskID, "request", map[string]interface{}{
+	s.logger.LogStep(baseCtx, taskID, "request", map[string]interface{}{
 		"input": s.sanitizeForLog(input),
 	})
 
-	output, err := s.processor.Process(ctx, input)
-	if err != nil {
-		s.logger.LogError(ctx, taskID, "process_error", err)
+	// Process context — has a deadline so the processor can't block forever.
+	processCtx, cancel := context.WithTimeout(baseCtx, time.Duration(s.taskTimeout)*time.Second)
+	defer cancel()
 
-		s.updateTaskWithRetry(ctx, taskID, &model.Task{
+	output, err := s.processor.Process(processCtx, input)
+	if err != nil {
+		s.logger.LogError(baseCtx, taskID, "process_error", err)
+
+		// Use baseCtx (no deadline) for the store write so retries aren't killed
+		// by the already-expired process deadline.
+		s.updateTaskWithRetry(baseCtx, taskID, &model.Task{
 			UUID:      taskID,
 			Status:    "failed",
 			Error:     err.Error(),
@@ -308,16 +360,24 @@ func (s *TaskService) processTask(taskID string, input json.RawMessage) {
 		return
 	}
 
-	s.logger.LogStep(ctx, taskID, "result", map[string]interface{}{
+	s.logger.LogStep(baseCtx, taskID, "result", map[string]interface{}{
 		"output": s.sanitizeOutputForLog(output),
 	})
 
-	s.updateTaskWithRetry(ctx, taskID, &model.Task{
+	s.updateTaskWithRetry(baseCtx, taskID, &model.Task{
 		UUID:      taskID,
 		Status:    "completed",
 		Output:    output,
 		UpdatedAt: time.Now().Unix(),
 	})
+}
+
+// updateTaskBestEffort attempts a single store update without retries.
+// Used for non-critical state transitions (e.g. pending → processing).
+func (s *TaskService) updateTaskBestEffort(ctx context.Context, taskID string, task *model.Task) {
+	if err := s.store.UpdateTask(ctx, task); err != nil {
+		slog.Warn("best-effort task update failed", "uuid", taskID, "target_status", task.Status, "error", err)
+	}
 }
 
 // updateTaskWithRetry attempts to update a task in the store, retrying up to 3 times.

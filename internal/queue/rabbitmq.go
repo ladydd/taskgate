@@ -31,6 +31,13 @@ type RabbitMQQueue struct {
 	consCh     *amqp.Channel
 	deliveries <-chan amqp.Delivery
 	closed     chan struct{}
+
+	// reconnectMu ensures only one goroutine performs reconnection at a time.
+	// Others wait on reconnectDone for the result.
+	reconnectMu   sync.Mutex
+	reconnecting  bool
+	reconnectDone chan struct{} // closed when the in-progress reconnect finishes
+	reconnectErr  error        // result of the last reconnect attempt
 }
 
 // Config holds the configuration for connecting to RabbitMQ.
@@ -67,6 +74,13 @@ func (q *RabbitMQQueue) connect() error {
 	if err != nil {
 		conn.Close()
 		return fmt.Errorf("failed to open publish channel: %w", err)
+	}
+
+	// Enable publisher confirms so Enqueue can verify the broker accepted the message.
+	if err := pubCh.Confirm(false); err != nil {
+		pubCh.Close()
+		conn.Close()
+		return fmt.Errorf("failed to enable publisher confirms: %w", err)
 	}
 
 	consCh, err := conn.Channel()
@@ -150,7 +164,45 @@ func (q *RabbitMQQueue) connect() error {
 }
 
 // reconnect attempts to re-establish the connection with exponential backoff.
-func (q *RabbitMQQueue) reconnect() error {
+// Only one goroutine performs the actual reconnection; others wait for the result.
+// The ctx parameter allows callers (e.g. workers during shutdown) to abort the wait.
+func (q *RabbitMQQueue) reconnect(ctx context.Context) error {
+	q.reconnectMu.Lock()
+	if q.reconnecting {
+		// Another goroutine is already reconnecting — wait for it, but respect our ctx.
+		done := q.reconnectDone
+		q.reconnectMu.Unlock()
+
+		select {
+		case <-done:
+			q.reconnectMu.Lock()
+			err := q.reconnectErr
+			q.reconnectMu.Unlock()
+			return err
+		case <-ctx.Done():
+			return fmt.Errorf("reconnect wait cancelled: %w", ctx.Err())
+		}
+	}
+	// We are the leader — mark reconnecting and create a done channel.
+	q.reconnecting = true
+	q.reconnectDone = make(chan struct{})
+	q.reconnectMu.Unlock()
+
+	err := q.doReconnect(ctx)
+
+	// Publish result and release waiters.
+	q.reconnectMu.Lock()
+	q.reconnectErr = err
+	q.reconnecting = false
+	close(q.reconnectDone)
+	q.reconnectMu.Unlock()
+
+	return err
+}
+
+// doReconnect performs the actual reconnection with exponential backoff.
+// It exits when: reconnection succeeds, q.closed is closed, or ctx is cancelled.
+func (q *RabbitMQQueue) doReconnect(ctx context.Context) error {
 	// Close old resources silently.
 	q.mu.Lock()
 	if q.consCh != nil {
@@ -171,13 +223,27 @@ func (q *RabbitMQQueue) reconnect() error {
 		select {
 		case <-q.closed:
 			return fmt.Errorf("queue closed during reconnect")
+		case <-ctx.Done():
+			return fmt.Errorf("reconnect cancelled: %w", ctx.Err())
 		default:
 		}
 
 		slog.Info("attempting RabbitMQ reconnect", "backoff", backoff.String())
 		if err := q.connect(); err != nil {
 			slog.Error("RabbitMQ reconnect failed", "error", err)
-			time.Sleep(backoff)
+
+			// Backoff with cancellation support — don't use time.Sleep.
+			timer := time.NewTimer(backoff)
+			select {
+			case <-timer.C:
+			case <-q.closed:
+				timer.Stop()
+				return fmt.Errorf("queue closed during reconnect backoff")
+			case <-ctx.Done():
+				timer.Stop()
+				return fmt.Errorf("reconnect cancelled during backoff: %w", ctx.Err())
+			}
+
 			backoff *= 2
 			if backoff > maxBackoff {
 				backoff = maxBackoff
@@ -207,7 +273,14 @@ func declareDLX(ch *amqp.Channel, cfg Config) error {
 	return nil
 }
 
-// Enqueue publishes a task message to the RabbitMQ queue.
+// Enqueue publishes a task message to the RabbitMQ queue with publisher confirm.
+//
+// Return semantics:
+//   - nil: broker acked — message is durably queued.
+//   - ErrEnqueueNacked: broker explicitly nacked — definite failure.
+//   - ErrEnqueueUncertain: confirm timed out or ctx cancelled — outcome unknown.
+//     The message may or may not have been accepted. Callers must NOT assume failure.
+//   - other errors: publish itself failed (marshal, channel nil, network).
 func (q *RabbitMQQueue) Enqueue(ctx context.Context, msg TaskMessage) error {
 	body, err := json.Marshal(msg)
 	if err != nil {
@@ -222,7 +295,7 @@ func (q *RabbitMQQueue) Enqueue(ctx context.Context, msg TaskMessage) error {
 		return fmt.Errorf("publish channel is not available (reconnecting?)")
 	}
 
-	return ch.PublishWithContext(ctx,
+	confirm, err := ch.PublishWithDeferredConfirmWithContext(ctx,
 		"", q.cfg.QueueName, false, false,
 		amqp.Publishing{
 			DeliveryMode: amqp.Persistent,
@@ -231,6 +304,22 @@ func (q *RabbitMQQueue) Enqueue(ctx context.Context, msg TaskMessage) error {
 			Body:         body,
 		},
 	)
+	if err != nil {
+		return fmt.Errorf("failed to publish task message: %w", err)
+	}
+
+	// Wait for broker acknowledgement, bounded by the caller's context.
+	acked, waitErr := confirm.WaitContext(ctx)
+	if waitErr != nil {
+		// Context cancelled or timed out before the broker responded.
+		// The message may or may not have been accepted — outcome is uncertain.
+		return fmt.Errorf("%w: %v", ErrEnqueueUncertain, waitErr)
+	}
+	if !acked {
+		return fmt.Errorf("%w: task %s", ErrEnqueueNacked, msg.TaskID)
+	}
+
+	return nil
 }
 
 // Dequeue blocks until a delivery is available or the context is cancelled.
@@ -245,8 +334,11 @@ func (q *RabbitMQQueue) Dequeue(ctx context.Context) (*Delivery, error) {
 		select {
 		case d, ok := <-deliveries:
 			if !ok {
-				// Channel closed — attempt reconnect.
-				if err := q.reconnect(); err != nil {
+				// Channel closed — check if we're shutting down before attempting reconnect.
+				if ctx.Err() != nil {
+					return nil, fmt.Errorf("dequeue cancelled during channel close: %w", ctx.Err())
+				}
+				if err := q.reconnect(ctx); err != nil {
 					return nil, err
 				}
 				// Loop back to retry with the new deliveries channel.

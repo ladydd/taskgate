@@ -110,8 +110,17 @@ func (s *RedisStore) UpdateTask(ctx context.Context, task *model.Task) error {
 	if task.Error != "" {
 		existing.Error = task.Error
 	}
+	if task.StartedAt != 0 {
+		existing.StartedAt = task.StartedAt
+	}
 	if task.UpdatedAt != 0 {
 		existing.UpdatedAt = task.UpdatedAt
+	}
+	// EnqueueUncertainAt is always merged: it can be set (>0) or explicitly
+	// cleared (0) when a worker starts processing. We use ClearEnqueueUncertain
+	// as a flag to distinguish "caller wants to clear" from "caller didn't set it".
+	if task.EnqueueUncertainAt != 0 || task.ClearEnqueueUncertain {
+		existing.EnqueueUncertainAt = task.EnqueueUncertainAt
 	}
 
 	data, err := json.Marshal(existing)

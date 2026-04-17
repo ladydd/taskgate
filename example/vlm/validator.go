@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/url"
+	"time"
 
 	"github.com/ladydd/taskgate/internal/netsec"
 )
@@ -13,11 +14,15 @@ import (
 type Validator struct{}
 
 // Validate parses the raw input as a VLM Request and checks all fields.
-func (v *Validator) Validate(input json.RawMessage) []string {
+func (v *Validator) Validate(ctx context.Context, input json.RawMessage) []string {
 	var req Request
 	if err := json.Unmarshal(input, &req); err != nil {
 		return []string{"failed to parse request: " + err.Error()}
 	}
+
+	// Use a bounded context for DNS resolution so it doesn't block the request indefinitely.
+	dnsCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
 
 	var errs []string
 
@@ -25,7 +30,7 @@ func (v *Validator) Validate(input json.RawMessage) []string {
 		errs = append(errs, "vlm_base_url: must not be empty")
 	} else if err := validateHTTPURL(req.VLMBaseURL); err != nil {
 		errs = append(errs, "vlm_base_url: "+err.Error())
-	} else if err := rejectPrivateURL(req.VLMBaseURL); err != nil {
+	} else if err := rejectPrivateURL(dnsCtx, req.VLMBaseURL); err != nil {
 		errs = append(errs, "vlm_base_url: "+err.Error())
 	}
 
@@ -44,7 +49,7 @@ func (v *Validator) Validate(input json.RawMessage) []string {
 	for i, rawURL := range req.ImageURLs {
 		if err := validateHTTPURL(rawURL); err != nil {
 			errs = append(errs, fmt.Sprintf("image_urls[%d]: %s", i, err.Error()))
-		} else if err := rejectPrivateURL(rawURL); err != nil {
+		} else if err := rejectPrivateURL(dnsCtx, rawURL); err != nil {
 			errs = append(errs, fmt.Sprintf("image_urls[%d]: %s", i, err.Error()))
 		}
 	}
@@ -66,11 +71,11 @@ func validateHTTPURL(rawURL string) error {
 	return nil
 }
 
-func rejectPrivateURL(rawURL string) error {
+func rejectPrivateURL(ctx context.Context, rawURL string) error {
 	u, err := url.Parse(rawURL)
 	if err != nil {
 		return fmt.Errorf("invalid URL format")
 	}
-	_, err = netsec.ResolvePublicIPs(context.Background(), u.Hostname(), nil)
+	_, err = netsec.ResolvePublicIPs(ctx, u.Hostname(), nil)
 	return err
 }
