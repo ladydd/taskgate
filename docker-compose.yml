@@ -23,9 +23,9 @@ services:
       - ./logs:/var/log/taskgate
     depends_on:
       redis:
-        condition: service_started
+        condition: service_healthy
       rabbitmq:
-        condition: service_started
+        condition: service_healthy
     restart: unless-stopped
     networks:
       - internal
@@ -34,6 +34,11 @@ services:
     image: redis:7-alpine
     volumes:
       - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
     restart: unless-stopped
     networks:
       - internal
@@ -44,6 +49,11 @@ services:
       - "15672:15672"  # Management UI (http://localhost:15672, guest/guest)
     volumes:
       - rabbitmq-data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
     restart: unless-stopped
     networks:
       - internal

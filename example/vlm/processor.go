@@ -111,9 +111,15 @@ func (p *Processor) Process(ctx context.Context, input json.RawMessage) (json.Ra
 	}
 	defer resp.Body.Close()
 
-	respBody, err := io.ReadAll(resp.Body)
+	// Limit response body to 10 MB to prevent OOM from malicious/broken upstream.
+	const maxResponseSize = 10 << 20
+	limitedReader := io.LimitReader(resp.Body, maxResponseSize+1)
+	respBody, err := io.ReadAll(limitedReader)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read VLM response body: %w", err)
+	}
+	if len(respBody) > maxResponseSize {
+		return nil, fmt.Errorf("VLM response body exceeds %d bytes limit", maxResponseSize)
 	}
 
 	if resp.StatusCode != http.StatusOK {

@@ -52,8 +52,11 @@ func main() {
 
 	// Redis.
 	redisClient := redis.NewClient(&redis.Options{
-		Addr:     cfg.RedisAddr,
-		Password: cfg.RedisPass,
+		Addr:         cfg.RedisAddr,
+		Password:     cfg.RedisPass,
+		DialTimeout:  5 * time.Second,
+		ReadTimeout:  3 * time.Second,
+		WriteTimeout: 3 * time.Second,
 	})
 	if err := redisClient.Ping(context.Background()).Err(); err != nil {
 		slog.Error("failed to connect to Redis", "addr", cfg.RedisAddr, "error", err)
@@ -88,7 +91,7 @@ func main() {
 	processor := vlm.NewProcessor(cfg.TaskTimeout, promptFilePath)
 	validator := &vlm.Validator{}
 
-	svc := service.NewTaskService(redisStore, fallbackStore, validator, processor, fileLogger, taskQueue, cfg.TaskTimeout, cfg.WorkerCount, cfg.RateLimit, service.LogSanitizer(vlm.SanitizeInput))
+	svc := service.NewTaskService(redisStore, fallbackStore, validator, processor, fileLogger, taskQueue, cfg.TaskTimeout, cfg.WorkerCount, cfg.RateLimit, service.LogSanitizer(vlm.SanitizeInput), nil)
 	svc.Start()
 	h := handler.NewHandler(svc)
 

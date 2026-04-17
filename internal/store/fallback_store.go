@@ -7,12 +7,17 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 
 	"github.com/ladydd/taskgate/internal/model"
 )
 
 // ErrFallbackTaskNotFound is returned when a task is not present in the fallback store.
 var ErrFallbackTaskNotFound = errors.New("fallback task not found")
+
+// uuidPattern validates that a string looks like a UUID (hex + hyphens only).
+// This prevents path traversal attacks via crafted "uuid" values.
+var uuidPattern = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
 
 // FallbackTaskStore stores completed or failed tasks outside Redis so they remain
 // retrievable if the primary store update fails.
@@ -48,7 +53,10 @@ func (s *FileFallbackTaskStore) SaveTask(ctx context.Context, task *model.Task) 
 		return fmt.Errorf("failed to marshal fallback task: %w", err)
 	}
 
-	path := s.taskPath(task.UUID)
+	path, err := s.taskPath(task.UUID)
+	if err != nil {
+		return err
+	}
 	tempPath := path + ".tmp"
 	if err := os.WriteFile(tempPath, data, 0644); err != nil {
 		return fmt.Errorf("failed to write fallback task temp file: %w", err)
@@ -62,7 +70,11 @@ func (s *FileFallbackTaskStore) SaveTask(ctx context.Context, task *model.Task) 
 
 // GetTask reads a final task state from disk.
 func (s *FileFallbackTaskStore) GetTask(ctx context.Context, uuid string) (*model.Task, error) {
-	data, err := os.ReadFile(s.taskPath(uuid))
+	path, err := s.taskPath(uuid)
+	if err != nil {
+		return nil, ErrFallbackTaskNotFound
+	}
+	data, err := os.ReadFile(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil, ErrFallbackTaskNotFound
@@ -78,6 +90,9 @@ func (s *FileFallbackTaskStore) GetTask(ctx context.Context, uuid string) (*mode
 	return &task, nil
 }
 
-func (s *FileFallbackTaskStore) taskPath(uuid string) string {
-	return filepath.Join(s.dir, uuid+".json")
+func (s *FileFallbackTaskStore) taskPath(uuid string) (string, error) {
+	if !uuidPattern.MatchString(uuid) {
+		return "", fmt.Errorf("invalid UUID format: %q", uuid)
+	}
+	return filepath.Join(s.dir, uuid+".json"), nil
 }

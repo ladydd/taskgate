@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"regexp"
 
 	"github.com/ladydd/taskgate/internal/model"
 	"github.com/ladydd/taskgate/internal/service"
@@ -12,6 +13,9 @@ import (
 
 	"github.com/gin-gonic/gin"
 )
+
+// uuidPattern validates UUID format at the HTTP layer.
+var uuidPattern = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
 
 // Handler handles HTTP requests for async task submission and result retrieval.
 // It delegates all business logic to the TaskService.
@@ -34,6 +38,16 @@ const maxBodySize = 10 << 20
 
 // Submit handles POST /submit requests to create an async task.
 func (h *Handler) Submit(c *gin.Context) {
+	// Reject non-JSON content types early.
+	ct := c.ContentType()
+	if ct != "" && ct != "application/json" {
+		c.JSON(http.StatusUnsupportedMediaType, model.ErrorResponse{
+			Error:   "unsupported_media_type",
+			Details: []string{"Content-Type must be application/json"},
+		})
+		return
+	}
+
 	// Limit body size to prevent abuse.
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxBodySize)
 
@@ -94,6 +108,14 @@ func (h *Handler) Submit(c *gin.Context) {
 // GetResult handles GET /result/:uuid requests to retrieve task status and results.
 func (h *Handler) GetResult(c *gin.Context) {
 	taskUUID := c.Param("uuid")
+
+	if !uuidPattern.MatchString(taskUUID) {
+		c.JSON(http.StatusBadRequest, model.ErrorResponse{
+			Error:   "invalid_uuid",
+			Details: []string{"uuid must be a valid UUID format"},
+		})
+		return
+	}
 
 	task, err := h.svc.GetTaskResult(c.Request.Context(), taskUUID)
 	if err != nil {

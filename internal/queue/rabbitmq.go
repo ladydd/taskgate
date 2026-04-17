@@ -218,6 +218,10 @@ func (q *RabbitMQQueue) Enqueue(ctx context.Context, msg TaskMessage) error {
 	ch := q.pubCh
 	q.mu.Unlock()
 
+	if ch == nil {
+		return fmt.Errorf("publish channel is not available (reconnecting?)")
+	}
+
 	return ch.PublishWithContext(ctx,
 		"", q.cfg.QueueName, false, false,
 		amqp.Publishing{
@@ -233,35 +237,37 @@ func (q *RabbitMQQueue) Enqueue(ctx context.Context, msg TaskMessage) error {
 // The caller MUST call Ack() after successful processing or Nack() on failure.
 // If the worker crashes without calling either, RabbitMQ will redeliver the message.
 func (q *RabbitMQQueue) Dequeue(ctx context.Context) (*Delivery, error) {
-	q.mu.Lock()
-	deliveries := q.deliveries
-	q.mu.Unlock()
+	for {
+		q.mu.Lock()
+		deliveries := q.deliveries
+		q.mu.Unlock()
 
-	select {
-	case d, ok := <-deliveries:
-		if !ok {
-			// Channel closed — attempt reconnect.
-			if err := q.reconnect(); err != nil {
-				return nil, err
+		select {
+		case d, ok := <-deliveries:
+			if !ok {
+				// Channel closed — attempt reconnect.
+				if err := q.reconnect(); err != nil {
+					return nil, err
+				}
+				// Loop back to retry with the new deliveries channel.
+				continue
 			}
-			// Retry after reconnect.
-			return q.Dequeue(ctx)
+
+			var msg TaskMessage
+			if err := json.Unmarshal(d.Body, &msg); err != nil {
+				_ = d.Nack(false, false) // → DLQ
+				return nil, fmt.Errorf("failed to unmarshal task message: %w", err)
+			}
+
+			return &Delivery{
+				Message: msg,
+				ack:     func() error { return d.Ack(false) },
+				nack:    func(requeue bool) error { return d.Nack(false, requeue) },
+			}, nil
+
+		case <-ctx.Done():
+			return nil, fmt.Errorf("dequeue cancelled: %w", ctx.Err())
 		}
-
-		var msg TaskMessage
-		if err := json.Unmarshal(d.Body, &msg); err != nil {
-			_ = d.Nack(false, false) // → DLQ
-			return nil, fmt.Errorf("failed to unmarshal task message: %w", err)
-		}
-
-		return &Delivery{
-			Message: msg,
-			ack:     func() error { return d.Ack(false) },
-			nack:    func(requeue bool) error { return d.Nack(false, requeue) },
-		}, nil
-
-	case <-ctx.Done():
-		return nil, fmt.Errorf("dequeue cancelled: %w", ctx.Err())
 	}
 }
 

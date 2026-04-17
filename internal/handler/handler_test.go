@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -17,6 +18,13 @@ import (
 
 	"github.com/gin-gonic/gin"
 )
+
+// TestMain sets gin to test mode once, avoiding data races from parallel tests
+// each calling gin.SetMode on the global variable.
+func TestMain(m *testing.M) {
+	gin.SetMode(gin.TestMode)
+	os.Exit(m.Run())
+}
 
 // --- stubs ---
 
@@ -78,28 +86,34 @@ func newTestHandler(
 	taskTimeout int,
 ) *Handler {
 	q := queue.NewStubQueue(100)
-	svc := service.NewTaskService(taskStore, fallback, stubValidator{}, stubProcessor{}, stubLogger{}, q, taskTimeout, 1, 0, nil)
+	svc := service.NewTaskService(taskStore, fallback, stubValidator{}, stubProcessor{}, stubLogger{}, q, taskTimeout, 1, 0, nil, nil)
 	// Don't start workers in tests — we only test the HTTP/result retrieval layer.
 	return NewHandler(svc)
 }
 
 // --- tests ---
 
+// Test UUIDs in valid format.
+const (
+	testUUID1 = "00000000-0000-0000-0000-000000000001"
+	testUUID2 = "00000000-0000-0000-0000-000000000002"
+	testUUID3 = "00000000-0000-0000-0000-000000000003"
+)
+
 func TestGetResultReturnsFallbackCompletedTask(t *testing.T) {
 	t.Parallel()
-	gin.SetMode(gin.TestMode)
 
 	h := newTestHandler(
 		stubTaskStore{
 			getTask: &model.Task{
-				UUID:      "task-1",
+				UUID:      testUUID1,
 				Status:    "pending",
 				CreatedAt: time.Now().Add(-10 * time.Minute).Unix(),
 			},
 		},
 		stubFallbackTaskStore{
 			task: &model.Task{
-				UUID:   "task-1",
+				UUID:   testUUID1,
 				Status: "completed",
 				Output: json.RawMessage(`{"script":"test output"}`),
 			},
@@ -109,9 +123,9 @@ func TestGetResultReturnsFallbackCompletedTask(t *testing.T) {
 
 	recorder := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(recorder)
-	req := httptest.NewRequest(http.MethodGet, "/result/task-1", nil)
+	req := httptest.NewRequest(http.MethodGet, "/result/"+testUUID1, nil)
 	ctx.Request = req
-	ctx.Params = gin.Params{{Key: "uuid", Value: "task-1"}}
+	ctx.Params = gin.Params{{Key: "uuid", Value: testUUID1}}
 
 	h.GetResult(ctx)
 
@@ -126,13 +140,12 @@ func TestGetResultReturnsFallbackCompletedTask(t *testing.T) {
 
 func TestGetResultReturnsFallbackWhenRedisLookupFails(t *testing.T) {
 	t.Parallel()
-	gin.SetMode(gin.TestMode)
 
 	h := newTestHandler(
 		stubTaskStore{getTaskErr: errors.New("redis unavailable")},
 		stubFallbackTaskStore{
 			task: &model.Task{
-				UUID:   "task-2",
+				UUID:   testUUID2,
 				Status: "failed",
 				Error:  "fallback error",
 			},
@@ -142,9 +155,9 @@ func TestGetResultReturnsFallbackWhenRedisLookupFails(t *testing.T) {
 
 	recorder := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(recorder)
-	req := httptest.NewRequest(http.MethodGet, "/result/task-2", nil)
+	req := httptest.NewRequest(http.MethodGet, "/result/"+testUUID2, nil)
 	ctx.Request = req
-	ctx.Params = gin.Params{{Key: "uuid", Value: "task-2"}}
+	ctx.Params = gin.Params{{Key: "uuid", Value: testUUID2}}
 
 	h.GetResult(ctx)
 
@@ -159,12 +172,11 @@ func TestGetResultReturnsFallbackWhenRedisLookupFails(t *testing.T) {
 
 func TestGetResultReturnsTimeoutFailureWhenNoFallbackExists(t *testing.T) {
 	t.Parallel()
-	gin.SetMode(gin.TestMode)
 
 	h := newTestHandler(
 		stubTaskStore{
 			getTask: &model.Task{
-				UUID:      "task-3",
+				UUID:      testUUID3,
 				Status:    "pending",
 				CreatedAt: time.Now().Add(-10 * time.Minute).Unix(),
 			},
@@ -175,9 +187,9 @@ func TestGetResultReturnsTimeoutFailureWhenNoFallbackExists(t *testing.T) {
 
 	recorder := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(recorder)
-	req := httptest.NewRequest(http.MethodGet, "/result/task-3", nil)
+	req := httptest.NewRequest(http.MethodGet, "/result/"+testUUID3, nil)
 	ctx.Request = req
-	ctx.Params = gin.Params{{Key: "uuid", Value: "task-3"}}
+	ctx.Params = gin.Params{{Key: "uuid", Value: testUUID3}}
 
 	h.GetResult(ctx)
 

@@ -44,6 +44,8 @@ func (v *Validator) Validate(input json.RawMessage) []string {
 	for i, rawURL := range req.ImageURLs {
 		if err := validateHTTPURL(rawURL); err != nil {
 			errs = append(errs, fmt.Sprintf("image_urls[%d]: %s", i, err.Error()))
+		} else if err := rejectPrivateURL(rawURL); err != nil {
+			errs = append(errs, fmt.Sprintf("image_urls[%d]: %s", i, err.Error()))
 		}
 	}
 

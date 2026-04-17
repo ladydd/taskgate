@@ -20,7 +20,7 @@ func TestFileFallbackTaskStoreRoundTrip(t *testing.T) {
 	}
 
 	task := &model.Task{
-		UUID:      "task-1",
+		UUID:      "00000000-0000-0000-0000-000000000001",
 		Status:    "completed",
 		Input:     json.RawMessage(`{"key":"value"}`),
 		Output:    json.RawMessage(`{"result":"done"}`),
@@ -65,7 +65,7 @@ func TestFileFallbackTaskStoreWithSanitizer(t *testing.T) {
 	}
 
 	task := &model.Task{
-		UUID:   "task-sanitize",
+		UUID:   "00000000-0000-0000-0000-000000000002",
 		Status: "completed",
 		Input:  json.RawMessage(`{"secret":"my-api-key","data":"hello"}`),
 	}
@@ -99,7 +99,7 @@ func TestFileFallbackTaskStoreReturnsNotFound(t *testing.T) {
 		t.Fatalf("NewFileFallbackTaskStore() error = %v", err)
 	}
 
-	_, err = store.GetTask(context.Background(), "missing")
+	_, err = store.GetTask(context.Background(), "not-a-valid-uuid")
 	if !errors.Is(err, ErrFallbackTaskNotFound) {
 		t.Fatalf("expected ErrFallbackTaskNotFound, got %v", err)
 	}

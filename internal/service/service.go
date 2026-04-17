@@ -33,20 +33,25 @@ type RequestValidator interface {
 // before it is written to log files. If nil, the input is logged as-is.
 type LogSanitizer func(input json.RawMessage) json.RawMessage
 
+// OutputLogSanitizer is an optional hook that strips sensitive fields from the task output
+// before it is written to log files. If nil, the output is logged as-is.
+type OutputLogSanitizer func(output json.RawMessage) json.RawMessage
+
 // TaskService orchestrates task creation, queuing, worker dispatch, and result retrieval.
 type TaskService struct {
-	store        store.TaskStore
-	fallback     store.FallbackTaskStore
-	validator    RequestValidator
-	processor    TaskProcessor
-	logger       logger.TaskLogger
-	queue        queue.TaskQueue
-	limiter      *rate.Limiter // nil means unlimited
-	logSanitizer LogSanitizer  // nil means no sanitization
-	taskTimeout  int           // seconds — used to detect stuck tasks
-	workerCount  int
-	wg           sync.WaitGroup
-	cancel       context.CancelFunc
+	store              store.TaskStore
+	fallback           store.FallbackTaskStore
+	validator          RequestValidator
+	processor          TaskProcessor
+	logger             logger.TaskLogger
+	queue              queue.TaskQueue
+	limiter            *rate.Limiter      // nil means unlimited
+	logSanitizer       LogSanitizer       // nil means no sanitization
+	outputLogSanitizer OutputLogSanitizer // nil means no sanitization
+	taskTimeout        int                // seconds — used to detect stuck tasks
+	workerCount        int
+	wg                 sync.WaitGroup
+	cancel             context.CancelFunc
 }
 
 // NewTaskService creates a new TaskService with the given dependencies.
@@ -68,6 +73,7 @@ func NewTaskService(
 	workerCount int,
 	rateLimit int,
 	logSanitizer LogSanitizer,
+	outputLogSanitizer OutputLogSanitizer,
 ) *TaskService {
 	if workerCount <= 0 {
 		workerCount = 1
@@ -79,16 +85,17 @@ func NewTaskService(
 	}
 
 	return &TaskService{
-		store:        store,
-		fallback:     fallback,
-		validator:    validator,
-		processor:    processor,
-		logger:       logger,
-		queue:        q,
-		limiter:      limiter,
-		logSanitizer: logSanitizer,
-		taskTimeout:  taskTimeout,
-		workerCount:  workerCount,
+		store:              store,
+		fallback:           fallback,
+		validator:          validator,
+		processor:          processor,
+		logger:             logger,
+		queue:              q,
+		limiter:            limiter,
+		logSanitizer:       logSanitizer,
+		outputLogSanitizer: outputLogSanitizer,
+		taskTimeout:        taskTimeout,
+		workerCount:        workerCount,
 	}
 }
 
@@ -232,6 +239,12 @@ func (s *TaskService) GetTaskResult(ctx context.Context, taskUUID string) (*mode
 		if task.CreatedAt > 0 && time.Now().Unix()-task.CreatedAt > stuckThreshold {
 			task.Status = "failed"
 			task.Error = "task processing timed out, possibly due to an internal state update failure; please resubmit"
+			task.UpdatedAt = time.Now().Unix()
+
+			// Persist the status change so subsequent queries see the same result.
+			if err := s.store.UpdateTask(ctx, task); err != nil {
+				slog.Error("failed to persist stuck task status", "uuid", task.UUID, "error", err)
+			}
 		}
 	}
 
@@ -259,11 +272,24 @@ func (s *TaskService) sanitizeForLog(input json.RawMessage) string {
 	return string(input)
 }
 
+// sanitizeOutputForLog applies the output log sanitizer if configured.
+func (s *TaskService) sanitizeOutputForLog(output json.RawMessage) string {
+	if s.outputLogSanitizer != nil {
+		return string(s.outputLogSanitizer(output))
+	}
+	return string(output)
+}
+
 // processTask calls the TaskProcessor and updates the task state.
 func (s *TaskService) processTask(taskID string, input json.RawMessage) {
 	ctx := context.WithValue(context.Background(), ContextKeyRequestID, taskID)
 	ctx = logger.WithLogger(ctx, s.logger)
 	ctx = context.WithValue(ctx, logger.RequestIDCtxKey(), taskID)
+
+	// Framework-level timeout — ensures no task can block a worker forever,
+	// even if the TaskProcessor implementation forgets to set its own deadline.
+	ctx, cancel := context.WithTimeout(ctx, time.Duration(s.taskTimeout)*time.Second)
+	defer cancel()
 
 	s.logger.LogStep(ctx, taskID, "request", map[string]interface{}{
 		"input": s.sanitizeForLog(input),
@@ -283,7 +309,7 @@ func (s *TaskService) processTask(taskID string, input json.RawMessage) {
 	}
 
 	s.logger.LogStep(ctx, taskID, "result", map[string]interface{}{
-		"output": string(output),
+		"output": s.sanitizeOutputForLog(output),
 	})
 
 	s.updateTaskWithRetry(ctx, taskID, &model.Task{

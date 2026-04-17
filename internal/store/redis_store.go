@@ -81,12 +81,43 @@ func (s *RedisStore) GetTask(ctx context.Context, uuid string) (*model.Task, err
 	return &task, nil
 }
 
-// UpdateTask overwrites an existing Task in Redis, resetting the TTL.
+// UpdateTask merges the provided fields into the existing Task in Redis and resets the TTL.
+// This avoids overwriting fields (e.g. Input, CreatedAt) that are not set on the update payload.
 func (s *RedisStore) UpdateTask(ctx context.Context, task *model.Task) error {
-	data, err := json.Marshal(task)
+	key := taskKey(task.UUID)
+
+	// Read the existing task so we can merge rather than blindly overwrite.
+	existing, err := s.GetTask(ctx, task.UUID)
+	if err != nil {
+		// If the task doesn't exist (e.g. TTL expired), fall back to a plain write.
+		if errors.Is(err, ErrTaskNotFound) {
+			data, marshalErr := json.Marshal(task)
+			if marshalErr != nil {
+				return fmt.Errorf("failed to marshal task: %w", marshalErr)
+			}
+			return s.client.Set(ctx, key, data, taskTTL).Err()
+		}
+		return fmt.Errorf("failed to read existing task for merge: %w", err)
+	}
+
+	// Merge: only overwrite fields that the caller explicitly set.
+	if task.Status != "" {
+		existing.Status = task.Status
+	}
+	if len(task.Output) > 0 {
+		existing.Output = task.Output
+	}
+	if task.Error != "" {
+		existing.Error = task.Error
+	}
+	if task.UpdatedAt != 0 {
+		existing.UpdatedAt = task.UpdatedAt
+	}
+
+	data, err := json.Marshal(existing)
 	if err != nil {
 		return fmt.Errorf("failed to marshal task: %w", err)
 	}
 
-	return s.client.Set(ctx, taskKey(task.UUID), data, taskTTL).Err()
+	return s.client.Set(ctx, key, data, taskTTL).Err()
 }
