@@ -21,7 +21,7 @@ type TaskProcessor interface {
 }
 
 type RequestValidator interface {
-    Validate(input json.RawMessage) []string
+    Validate(ctx context.Context, input json.RawMessage) []string
 }
 ```
 
@@ -36,7 +36,7 @@ type RequestValidator interface {
 - **速率限制** — 令牌桶限流，精确控制每秒打向下游的请求数
 - **Redis 状态存储** — 任务状态和结果持久化，7 天 TTL
 - **文件兜底存储** — Redis 写入失败时自动持久化到本地文件
-- **卡死任务检测** — pending 超过 2 倍超时自动标记为 failed
+- **卡死任务检测** — processing 状态超过 2 倍超时自动标记为 failed
 - **输入脱敏钩子** — 持久化前自动剥离敏感字段（API Key、Token 等）
 - **结构化日志** — 基于 slog 的统一 JSON 日志，按天轮转，保留天数可配置
 - **SSRF 防护** — DNS 解析校验，拒绝内网/回环地址
@@ -192,7 +192,7 @@ func (myProcessor) Process(ctx context.Context, input json.RawMessage) (json.Raw
 
 type myValidator struct{}
 
-func (myValidator) Validate(input json.RawMessage) []string {
+func (myValidator) Validate(ctx context.Context, input json.RawMessage) []string {
     // 返回错误描述列表，空切片表示校验通过
     return nil
 }

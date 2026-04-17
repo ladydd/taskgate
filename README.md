@@ -21,7 +21,7 @@ type TaskProcessor interface {
 }
 
 type RequestValidator interface {
-    Validate(input json.RawMessage) []string
+    Validate(ctx context.Context, input json.RawMessage) []string
 }
 ```
 
@@ -36,7 +36,7 @@ The framework handles everything else.
 - **Rate limiting** — token bucket limiter caps requests per second to protect downstream APIs
 - **Redis state store** — task status and results persisted with 7-day TTL
 - **File fallback store** — automatic local persistence when Redis writes fail
-- **Stuck task detection** — pending tasks exceeding 2x timeout are auto-marked as failed
+- **Stuck task detection** — processing tasks exceeding 2x timeout are auto-marked as failed
 - **Input sanitization hook** — strip sensitive fields (API keys, tokens) before persistence
 - **Structured logging** — unified slog-based JSON logging to daily-rotated files with configurable retention
 - **SSRF protection** — DNS resolution validation blocks private/loopback addresses
@@ -190,7 +190,7 @@ func (myProcessor) Process(ctx context.Context, input json.RawMessage) (json.Raw
 
 type myValidator struct{}
 
-func (myValidator) Validate(input json.RawMessage) []string {
+func (myValidator) Validate(ctx context.Context, input json.RawMessage) []string {
     // Return error strings for invalid input, empty slice if valid.
     return nil
 }
