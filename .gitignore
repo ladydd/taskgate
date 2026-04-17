@@ -1,5 +1,5 @@
 # Build artifacts
-server
+/server
 *.exe
 
 # Logs (created at runtime)
