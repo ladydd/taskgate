@@ -1,0 +1,17 @@
+# Build artifacts
+server
+*.exe
+
+# Logs (created at runtime)
+logs/
+
+# IDE
+.vscode/
+.idea/
+
+# Kiro
+.kiro/
+
+# OS
+.DS_Store
+Thumbs.db

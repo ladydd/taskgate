@@ -1,0 +1,57 @@
+services:
+  app:
+    build: .
+    ports:
+      - "9531:9531"
+    environment:
+      - PORT=9531
+      - REDIS_ADDR=redis:6379
+      - REDIS_PASS=
+      - TASK_TIMEOUT=120
+      - LOG_DIR=/var/log/taskgate
+      - FALLBACK_DIR=/var/log/taskgate/fallback
+      # RabbitMQ
+      - RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672/
+      - RABBITMQ_QUEUE=tasks
+      - WORKER_COUNT=10
+      - PREFETCH_COUNT=10
+      - MAX_PRIORITY=10
+      - DEAD_LETTER_QUEUE=tasks.dead
+      # Rate limiting: max tasks/second sent to downstream (0 = unlimited)
+      - RATE_LIMIT=50
+    volumes:
+      - ./logs:/var/log/taskgate
+    depends_on:
+      redis:
+        condition: service_started
+      rabbitmq:
+        condition: service_started
+    restart: unless-stopped
+    networks:
+      - internal
+
+  redis:
+    image: redis:7-alpine
+    volumes:
+      - redis-data:/data
+    restart: unless-stopped
+    networks:
+      - internal
+
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    ports:
+      - "15672:15672"  # Management UI (http://localhost:15672, guest/guest)
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+    restart: unless-stopped
+    networks:
+      - internal
+
+networks:
+  internal:
+    driver: bridge
+
+volumes:
+  redis-data:
+  rabbitmq-data:

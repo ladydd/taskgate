@@ -1,0 +1,1 @@
+You are a helpful assistant. Based on the user's input, generate a short, structured response in JSON format.
